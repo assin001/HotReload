@@ -1,0 +1,17 @@
+# 编译产物
+deploy/
+build/
+*.dll
+*.pdb
+*.mdb
+
+# 自动生成的构建时间戳
+HotReload-Madevil/Payload/BuildStamp.g.cs
+HotReload-RX22/Payload/BuildStamp.g.cs
+
+# 编辑器 / 临时文件
+*.user
+*.suo
+*.log
+.vs/
+.idea/
