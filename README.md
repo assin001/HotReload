@@ -1,10 +1,16 @@
-# HotReload — 运行时 zipmod 热重载
+<h1 align="center">HotReload — 运行时 zipmod 热重载</h1>
 
-**v1.0.0 by As-sin** · Koikatu / CharaStudio
+<p align="center">
+  <b>v1.0.0 by As-sin</b> · Koikatu / CharaStudio
+</p>
 
-不重启游戏，替换 zipmod 里的 `.unity3d` 后立即生效，并自动刷新场上角色的衣服/饰品/头发。
+<p align="center">
+  不重启游戏，替换 zipmod 里的 <code>.unity3d</code> 后立即生效，并自动刷新场上角色的衣服/饰品/头发。
+</p>
 
-![窗口](docs/window.png)
+<p align="center">
+  <img src="docs/window.png" alt="窗口" width="520">
+</p>
 
 ---
 
