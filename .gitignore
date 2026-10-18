@@ -5,6 +5,11 @@ build/
 *.pdb
 *.mdb
 
+# 发布包（作为 release 附件上传，不进仓库）
+*.zip
+*.7z
+*.rar
+
 # 自动生成的构建时间戳
 HotReload-Madevil/Payload/BuildStamp.g.cs
 HotReload-RX22/Payload/BuildStamp.g.cs
