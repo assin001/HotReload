@@ -15,7 +15,7 @@
 | 项目 | 目标 |
 | --- | --- |
 | `HotReload-Madevil` | Madevil / 经典 BepisPlugins（KK 18.x，`Archives`） |
-| `HotReload-RX22` | HF Patch / RX22（2024+，`Zipmods`） |
+| `HotReload-HFPatch` | HF Patch / RX22（2024+，`Zipmods`） |
 
 反射适配，不编译依赖 `Sideloader.dll`。
 
