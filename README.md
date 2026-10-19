@@ -19,6 +19,8 @@
 
 反射适配，不编译依赖 `Sideloader.dll`。
 
+> **仅适用于 Koikatu（KK）。** KoikatuSunshine（KKS）无法使用：两作的部件类、刷新接口与 Sideloader 注册表结构不同，本插件不会正常工作。
+
 ---
 
 ## 安装
