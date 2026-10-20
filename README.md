@@ -67,7 +67,7 @@ BepInEx/
 ```powershell
 .\build.ps1                                  # 自动探测游戏目录，编译并部署
 .\build.ps1 -BootOnly                        # 只更新壳
-.\build.ps1 -GameDir 'E:\game\GDAkk\Koikatu' # 指定游戏目录
+.\build.ps1 -GameDir                         # 指定游戏目录
 ```
 
 ---
