@@ -164,8 +164,8 @@ namespace HotReload.Payload
                 GUILayout.Space(2f);
                 GUILayout.BeginHorizontal();
                 GUILayout.Label("选项", _hintStyle, GUILayout.Width(56f));
-                ContentHotReload.ReloadLists = GUILayout.Toggle(ContentHotReload.ReloadLists,
-                    " 表格/manifest", _toggleStyle, GUILayout.Height(20f));
+                ContentHotReload.SetReloadLists(GUILayout.Toggle(ContentHotReload.ReloadLists,
+                    " 表格/manifest", _toggleStyle, GUILayout.Height(20f)));
                 GUILayout.EndHorizontal();
 
                 // 操作

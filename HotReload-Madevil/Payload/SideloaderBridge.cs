@@ -47,6 +47,18 @@ namespace HotReload.Payload
         static MethodInfo _loadAllUnityArchives;
         static Type _zipType;
 
+        // ---- 表格/manifest 真正刷新要用的入口（Sideloader 自己的列表与 AutoResolver 解析表）----
+        static FieldInfo _loadedManifestsField;
+        static FieldInfo _dictListInfoField;          // ChaListControl.dictListInfo
+        static PropertyInfo _externalDataListProp;    // Lists.ExternalDataList
+        static MethodInfo _setPossessNew;             // Sideloader.SetPossessNew(ChaListData)
+        static Type _resolveInfoType;                 // Sideloader.AutoResolver.ResolveInfo
+        static Type _resolveInfoListType;
+        static PropertyInfo _riGuid, _riSlot, _riLocalSlot, _riCategoryNo;
+        static PropertyInfo _loadedResolveInfosProp;  // UniversalAutoResolver.LoadedResolutionInfo
+        static MethodInfo _generateResolutionInfo;
+        static MethodInfo _setResolveInfos;
+
         public static bool Available { get; private set; }
         public static string LastError { get; private set; }
 
@@ -112,11 +124,38 @@ namespace HotReload.Payload
             _loadAllUnityArchives = _sideloaderType.GetMethod("LoadAllUnityArchives",
                 any | BindingFlags.Instance, null, new[] { _zipType, typeof(string) }, null);
 
+            // ---- 表格 / manifest 刷新所需的额外入口 ----
+            _loadedManifestsField = _sideloaderType.GetField("LoadedManifests", any | BindingFlags.Static);
+            _setPossessNew = _sideloaderType.GetMethod("SetPossessNew",
+                any | BindingFlags.Instance, null, new[] { _loadCsv.ReturnType }, null);
+
+            var chaListType = FindType("ChaListControl");
+            if (chaListType != null)
+                _dictListInfoField = chaListType.GetField("dictListInfo", any | BindingFlags.Instance);
+
+            _externalDataListProp = _listsType.GetProperty("ExternalDataList", any | BindingFlags.Static);
+
+            var resolverType = FindType("Sideloader.AutoResolver.UniversalAutoResolver");
+            _resolveInfoType = FindType("Sideloader.AutoResolver.ResolveInfo");
+            if (resolverType != null && _resolveInfoType != null)
+            {
+                _resolveInfoListType = typeof(List<>).MakeGenericType(_resolveInfoType);
+                _riGuid = _resolveInfoType.GetProperty("GUID");
+                _riSlot = _resolveInfoType.GetProperty("Slot");
+                _riLocalSlot = _resolveInfoType.GetProperty("LocalSlot");
+                _riCategoryNo = _resolveInfoType.GetProperty("CategoryNo");
+                _loadedResolveInfosProp = resolverType.GetProperty("LoadedResolutionInfo", any | BindingFlags.Static);
+                _generateResolutionInfo = resolverType.GetMethod("GenerateResolutionInfo", any | BindingFlags.Static);
+                _setResolveInfos = resolverType.GetMethod("SetResolveInfos", any | BindingFlags.Static);
+            }
+
             Capabilities = "AddBundleLoader=" + (_addBundleLoader == null ? "缺" : "OK")
                 + " RandomizeCAB=" + (_randomizeCab == null ? "缺" : "OK")
                 + " LoadAllUnityArchives=" + (_loadAllUnityArchives == null ? "缺" : "OK")
                 + " ABM=" + (_abmType == null ? "缺" : "OK")
-                + " Manifest=" + (_manifestsField == null ? "缺" : "OK");
+                + " Manifest=" + (_manifestsField == null ? "缺" : "OK")
+                + " AutoResolver=" + (_setResolveInfos == null ? "缺" : "OK")
+                + " 外部表=" + (_externalDataListProp == null ? "缺" : "OK");
 
             Available = true;
         }
@@ -287,7 +326,7 @@ namespace HotReload.Payload
                 if (reloadLists)
                 {
                     steps.Append("；").Append(MergeLists(zip, chaListControl));
-                    RefreshManifest(zip);
+                    steps.Append("；").Append(RefreshManifest(zip));
                 }
                 else
                 {
@@ -328,31 +367,88 @@ namespace HotReload.Payload
             }
         }
 
-        /// <summary>用新 zip 里的 manifest.xml 覆盖 Manifests 里同 guid 的旧记录。</summary>
-        static void RefreshManifest(object zip)
+        /// <summary>用新 zip 里的 manifest.xml 覆盖 Manifests / LoadedManifests 里同 guid 的旧记录。</summary>
+        static string RefreshManifest(object zip)
         {
             try
             {
-                if (_manifestType == null || _manifestsField == null) return;
+                if (_manifestType == null || _manifestsField == null) return "manifest 跳过（接口缺失）";
 
-                var tryLoad = _manifestType.GetMethod("TryLoadFromZip",
-                    BindingFlags.Public | BindingFlags.Static);
-                if (tryLoad == null) return;
+                var manifest = LoadManifestFromZip(zip);
+                if (manifest == null)
+                    return "manifest 没读到" + (string.IsNullOrEmpty(_manifestError) ? "" : ": " + _manifestError);
 
-                var args = new object[] { zip, null };
-                var ok = (bool)tryLoad.Invoke(null, args);
-                var manifest = args[1];
-                if (!ok || manifest == null) return;
-
-                var guidProp = _manifestType.GetProperty("GUID");
-                var guid = guidProp == null ? null : guidProp.GetValue(manifest, null) as string;
-                if (string.IsNullOrEmpty(guid)) return;
+                var guid = ManifestString(manifest, "GUID");
+                if (string.IsNullOrEmpty(guid)) return "manifest 没有 guid";
 
                 var manifests = _manifestsField.GetValue(null) as IDictionary;
                 if (manifests != null) manifests[guid] = manifest;
+
+                // 模组列表/缺失提示读的是 LoadedManifests，不换掉的话名字还是旧的
+                var loaded = _loadedManifestsField == null ? null : _loadedManifestsField.GetValue(null) as IList;
+                if (loaded != null)
+                {
+                    bool replaced = false;
+                    for (int i = 0; i < loaded.Count; i++)
+                    {
+                        if (ManifestString(loaded[i], "GUID") != guid) continue;
+                        loaded[i] = manifest;
+                        replaced = true;
+                        break;
+                    }
+                    if (!replaced) loaded.Add(manifest);
+                }
+
+                var name = ManifestString(manifest, "Name");
+                return "manifest=" + guid + (string.IsNullOrEmpty(name) ? "" : "（" + name + "）");
+            }
+            catch (Exception e)
+            {
+                return "manifest 刷新失败: " + Unwrap(e).Message;
+            }
+        }
+
+        /// <summary>从 zip 里解出 manifest.xml（没有就返回 null，原因放 _manifestError）。</summary>
+        static object LoadManifestFromZip(object zip)
+        {
+            _manifestError = null;
+            try
+            {
+                if (_manifestType == null) { _manifestError = "找不到 Sideloader.Manifest"; return null; }
+
+                // 注意：TryLoadFromZip 是 internal static（不是 public），只查 Public 会拿到 null，
+                // 表现出来就是"每张表都读了，但 manifest 永远没读到"。
+                var tryLoad = _manifestType.GetMethod("TryLoadFromZip",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                if (tryLoad == null) { _manifestError = "Manifest.TryLoadFromZip 结构变化"; return null; }
+
+                var args = new object[] { zip, null };
+                var ok = (bool)tryLoad.Invoke(null, args);
+                if (ok) return args[1];
+
+                _manifestError = "TryLoadFromZip 返回 false";
+                return null;
+            }
+            catch (Exception e)
+            {
+                _manifestError = Unwrap(e).Message;
+                return null;
+            }
+        }
+
+        static string _manifestError;
+
+        static string ManifestString(object manifest, string property)
+        {
+            if (manifest == null) return null;
+            try
+            {
+                var p = manifest.GetType().GetProperty(property);
+                return p == null ? null : p.GetValue(manifest, null) as string;
             }
             catch (Exception)
             {
+                return null;
             }
         }
 
@@ -881,13 +977,30 @@ namespace HotReload.Payload
             }
         }
 
+        /// <summary>
+        /// 重读这个包里的 characustom 表格。
+        /// 注意 Sideloader 的 Lists.LoadList 只往 dictListInfo 里"补缺"，同 ID 的行永远不会被覆盖，
+        /// 所以光调 LoadList 会出现"日志说读了 5 张表，游戏里还是旧名字"。这里补齐三件事：
+        ///   1) 复用上次分配到的 slot，避免每重载一次就多出一整套 ID
+        ///   2) 先删掉这个包在 dictListInfo / ExternalDataList 里的旧条目，再按新数据加回去
+        ///   3) 重新生成 AutoResolver 的 ResolveInfo（卡片里写的 guid 就是从这里来的）
+        /// </summary>
         static string MergeLists(object zip, object chaListControl)
         {
             if (chaListControl == null) return "csv 跳过（没拿到 ChaListControl）";
 
+            var manifest = LoadManifestFromZip(zip);
+            var guid = ManifestString(manifest, "GUID");
+            var manifestError = _manifestError;
+
             int ok = 0;
             int fail = 0;
+            int added = 0;
+            int updated = 0;
+            int removed = 0;
             string firstError = null;
+            var seenCategories = new HashSet<int>();
+            var shortfall = new List<string>();
 
             foreach (var entry in EnumerateEntries(zip))
             {
@@ -905,8 +1018,27 @@ namespace HotReload.Payload
                     {
                         var data = _loadCsv.Invoke(null, new object[] { stream });
                         if (data == null) continue;
-                        _loadList.Invoke(null, new object[] { chaListControl, data });
+
+                        // 和启动时同一条路：Possess 改 1（DisplaySlotInName 时的名字前缀也在这里）
+                        if (_setPossessNew != null)
+                        {
+                            try { _setPossessNew.Invoke(_instance, new object[] { data }); }
+                            catch (Exception) { }
+                        }
+
+                        int a;
+                        int u;
+                        int total;
+                        int landed;
+                        var category = CategoryOf(data);
+                        RefreshListData(chaListControl, data, manifest, guid, out a, out u, out total, out landed);
+                        added += a;
+                        updated += u;
                         ok++;
+                        seenCategories.Add(category);
+
+                        // 入列不全 = 数据换好了但没进 ChaListControl（多半是类目还没初始化）
+                        if (total > 0 && landed < total) shortfall.Add("类目" + category + " 入列=" + landed + "/" + total);
                     }
                 }
                 catch (Exception e)
@@ -916,7 +1048,406 @@ namespace HotReload.Payload
                     if (firstError == null) firstError = Unwrap(e).Message + " (" + entryName + ")";
                 }
             }
-            return "csv 成功=" + ok + " 失败=" + fail + (firstError == null ? "" : " 首个错误: " + firstError);
+
+            // 整个 csv 被删掉的情况：包里的类目少了，旧条目也得跟着消失，否则"删了还在"
+            if (fail == 0 && ok > 0 && !string.IsNullOrEmpty(guid))
+                removed = RemoveMissingCategories(chaListControl, guid, seenCategories);
+
+            var sb = new System.Text.StringBuilder();
+            sb.Append("csv 成功=").Append(ok).Append(" 失败=").Append(fail);
+            sb.Append(" 换掉旧条目=").Append(updated).Append(" 新条目=").Append(added);
+            if (removed > 0) sb.Append(" 删掉缺失类目条目=").Append(removed);
+            if (shortfall.Count > 0) sb.Append(" 入列不全: ").Append(string.Join("，", shortfall.ToArray()));
+            if (string.IsNullOrEmpty(guid))
+                sb.Append("（没读到 manifest，未分配 slot")
+                  .Append(string.IsNullOrEmpty(manifestError) ? "" : ": " + manifestError)
+                  .Append("）");
+            if (firstError != null) sb.Append(" 首个错误: ").Append(firstError);
+            return sb.ToString();
+        }
+
+        /// <summary>zip 里已经没有这个类目的 csv 了：把这个包在该类目下的旧条目一并清掉。</summary>
+        static int RemoveMissingCategories(object chaListControl, string guid, HashSet<int> keep)
+        {
+            try
+            {
+                if (_riGuid == null || _riLocalSlot == null || _riCategoryNo == null) return 0;
+
+                var all = GetLoadedResolveInfos();
+                var dropped = new Dictionary<int, HashSet<int>>();
+                var remaining = NewResolveInfoList();
+                if (remaining == null) return 0;
+
+                for (int i = 0; i < all.Count; i++)
+                {
+                    var info = all[i];
+                    var category = CategoryOfResolve(info);
+                    if (StringProp(info, _riGuid) == guid && !keep.Contains(category))
+                    {
+                        HashSet<int> locals;
+                        if (!dropped.TryGetValue(category, out locals))
+                        {
+                            locals = new HashSet<int>();
+                            dropped[category] = locals;
+                        }
+                        locals.Add(IntProp(info, _riLocalSlot));
+                        continue;
+                    }
+
+                    remaining.Add(info);
+                }
+
+                if (dropped.Count == 0) return 0;
+
+                var dictInfo = _dictListInfoField == null ? null : _dictListInfoField.GetValue(chaListControl) as IDictionary;
+                var ext = _externalDataListProp == null ? null : _externalDataListProp.GetValue(null, null) as IList;
+                int removed = 0;
+
+                foreach (var kv in dropped)
+                {
+                    var catDict = FindCategoryDict(dictInfo, kv.Key);
+                    if (catDict != null)
+                    {
+                        foreach (var local in kv.Value)
+                            if (catDict.Contains(local)) { catDict.Remove(local); removed++; }
+                    }
+
+                    if (ext == null) continue;
+
+                    var drop = new List<int>();
+                    for (int i = 0; i < ext.Count; i++)
+                    {
+                        var d = ext[i];
+                        if (d == null || CategoryOf(d) != kv.Key) continue;
+                        if (SharesLocalSlots(d, kv.Value)) drop.Add(i);
+                    }
+                    for (int i = drop.Count - 1; i >= 0; i--) ext.RemoveAt(drop[i]);
+                }
+
+                if (_setResolveInfos != null) _setResolveInfos.Invoke(null, new object[] { remaining });
+                return removed;
+            }
+            catch (Exception)
+            {
+                return 0;
+            }
+        }
+
+        /// <summary>
+        /// 用新解析出来的表格替换某个类目的旧数据。
+        /// slot 复用：Sideloader 的 ResolveInfo 里 Slot=作者 CSV 里的 ID，LocalSlot=游戏内实际分配的 ID。
+        /// </summary>
+        static void RefreshListData(object chaListControl, object data, object manifest, string guid,
+            out int added, out int updated, out int total, out int landed)
+        {
+            added = 0;
+            updated = 0;
+            total = 0;
+            landed = 0;
+
+            var category = CategoryOf(data);
+            var rows = RowsOf(data);
+            if (rows == null) return;
+
+            var canResolve = !string.IsNullOrEmpty(guid)
+                && _loadedResolveInfosProp != null && _riGuid != null && _riSlot != null && _riLocalSlot != null;
+
+            var oldInfos = canResolve ? FindResolveInfos(guid, category) : new List<object>();
+
+            var oldBySlot = new Dictionary<int, object>();
+            var oldLocals = new HashSet<int>();
+            for (int i = 0; i < oldInfos.Count; i++)
+            {
+                var info = oldInfos[i];
+                var slot = IntProp(info, _riSlot);
+                if (!oldBySlot.ContainsKey(slot)) oldBySlot[slot] = info;
+                oldLocals.Add(IntProp(info, _riLocalSlot));
+            }
+
+            // 让 Sideloader 自己生成 ResolveInfo：属性分类、槽位分配全按它的规则来。
+            // 它会顺手把每行第一列（ID）改成本次新分配的 LocalSlot。
+            var fresh = !canResolve || _generateResolutionInfo == null || manifest == null ? null : NewResolveInfoList();
+            if (fresh != null)
+            {
+                try { _generateResolutionInfo.Invoke(null, new object[] { manifest, data, fresh }); }
+                catch (Exception) { fresh = null; }
+            }
+
+            if (fresh == null)
+            {
+                // 没有 AutoResolver 可用：只能按老办法"补缺"，改名的行刷不出来，但不会把 ID 弄乱
+                try { _loadList.Invoke(null, new object[] { chaListControl, data }); }
+                catch (Exception) { }
+                return;
+            }
+
+            // 把作者原来的 ID 重新对回上次分配的 LocalSlot
+            var remap = new Dictionary<int, int>();
+            for (int i = 0; i < fresh.Count; i++)
+            {
+                var info = fresh[i];
+                var local = IntProp(info, _riLocalSlot);
+
+                object oldInfo;
+                if (!oldBySlot.TryGetValue(IntProp(info, _riSlot), out oldInfo)) continue;
+
+                var oldLocal = IntProp(oldInfo, _riLocalSlot);
+                if (oldLocal == local) continue;
+
+                SetIntProp(info, _riLocalSlot, oldLocal);
+                if (!remap.ContainsKey(local)) remap[local] = oldLocal;
+            }
+
+            if (remap.Count > 0)
+            {
+                foreach (DictionaryEntry row in rows)
+                {
+                    var cells = row.Value as IList<string>;
+                    if (cells == null || cells.Count == 0) continue;
+
+                    int v;
+                    if (int.TryParse(cells[0], out v) && remap.ContainsKey(v)) cells[0] = remap[v].ToString();
+                }
+            }
+
+            var finalLocals = new HashSet<int>();
+            for (int i = 0; i < fresh.Count; i++) finalLocals.Add(IntProp(fresh[i], _riLocalSlot));
+            foreach (var local in finalLocals)
+                if (!oldLocals.Contains(local)) added++;
+
+            // 1) 删掉旧条目：LoadList 只会补缺，不删的话新名字永远进不去
+            var dictInfo = _dictListInfoField == null ? null : _dictListInfoField.GetValue(chaListControl) as IDictionary;
+            var catDict = FindCategoryDict(dictInfo, category);
+            if (catDict != null)
+            {
+                foreach (var local in oldLocals)
+                {
+                    if (!catDict.Contains(local)) continue;
+                    catDict.Remove(local);
+                    updated++;
+                }
+            }
+
+            // 2) 按新数据补回去
+            try { _loadList.Invoke(null, new object[] { chaListControl, data }); }
+            catch (Exception) { }
+
+            // 落列自检：新数据里的条目是否真的进了 ChaListControl（类目没初始化时 LoadList 会空跑）
+            catDict = FindCategoryDict(dictInfo, category);
+            foreach (var local in finalLocals)
+            {
+                total++;
+                if (catDict != null && catDict.Contains(local)) landed++;
+            }
+
+            // 3) Maker 重建列表读的是 ExternalDataList，旧对象不换掉就算 dictListInfo 更新了也还是旧名字
+            ReplaceExternalList(data, category, oldLocals);
+
+            // 4) 卡片里的 guid 来自 ResolveInfo 解析表，必须一起换
+            RebuildResolveInfos(guid, category, fresh);
+        }
+
+        static void ReplaceExternalList(object data, int category, HashSet<int> oldLocals)
+        {
+            try
+            {
+                var ext = _externalDataListProp == null ? null : _externalDataListProp.GetValue(null, null) as IList;
+                if (ext == null) return;
+
+                var drop = new List<int>();
+                if (oldLocals.Count > 0)
+                {
+                    for (int i = 0; i < ext.Count; i++)
+                    {
+                        var d = ext[i];
+                        if (d == null || CategoryOf(d) != category) continue;
+                        if (SharesLocalSlots(d, oldLocals)) drop.Add(i);
+                    }
+                }
+
+                for (int i = drop.Count - 1; i >= 0; i--) ext.RemoveAt(drop[i]);
+                ext.Add(data);
+            }
+            catch (Exception)
+            {
+            }
+        }
+
+        static void RebuildResolveInfos(string guid, int category, IList fresh)
+        {
+            if (_setResolveInfos == null || string.IsNullOrEmpty(guid) || fresh == null) return;
+
+            try
+            {
+                var merged = NewResolveInfoList();
+                if (merged == null) return;
+
+                var all = GetLoadedResolveInfos();
+                for (int i = 0; i < all.Count; i++)
+                {
+                    var info = all[i];
+                    // 旧记录整条换掉（同一个 guid 的同一个类目）
+                    if (StringProp(info, _riGuid) == guid && CategoryOfResolve(info) == category) continue;
+                    merged.Add(info);
+                }
+
+                for (int i = 0; i < fresh.Count; i++) merged.Add(fresh[i]);
+
+                _setResolveInfos.Invoke(null, new object[] { merged });
+            }
+            catch (Exception)
+            {
+            }
+        }
+
+        static List<object> FindResolveInfos(string guid, int category)
+        {
+            var result = new List<object>();
+            var all = GetLoadedResolveInfos();
+            for (int i = 0; i < all.Count; i++)
+            {
+                var info = all[i];
+                if (StringProp(info, _riGuid) != guid) continue;
+                if (CategoryOfResolve(info) != category) continue;
+                result.Add(info);
+            }
+            return result;
+        }
+
+        static List<object> GetLoadedResolveInfos()
+        {
+            var result = new List<object>();
+            try
+            {
+                if (_loadedResolveInfosProp == null) return result;
+
+                var e = _loadedResolveInfosProp.GetValue(null, null) as IEnumerable;
+                if (e == null) return result;
+
+                foreach (var info in e)
+                    if (info != null) result.Add(info);
+            }
+            catch (Exception)
+            {
+            }
+            return result;
+        }
+
+        static IList NewResolveInfoList()
+        {
+            try
+            {
+                return _resolveInfoListType == null ? null : (IList)Activator.CreateInstance(_resolveInfoListType);
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        static IDictionary FindCategoryDict(IDictionary dictInfo, int category)
+        {
+            if (dictInfo == null) return null;
+
+            try
+            {
+                foreach (DictionaryEntry e in dictInfo)
+                    if (Convert.ToInt32(e.Key) == category) return e.Value as IDictionary;
+            }
+            catch (Exception)
+            {
+            }
+            return null;
+        }
+
+        static bool SharesLocalSlots(object data, HashSet<int> locals)
+        {
+            var rows = RowsOf(data);
+            if (rows == null) return false;
+
+            foreach (DictionaryEntry row in rows)
+            {
+                var cells = row.Value as IList<string>;
+                if (cells == null || cells.Count == 0) continue;
+
+                int v;
+                if (int.TryParse(cells[0], out v) && locals.Contains(v)) return true;
+            }
+            return false;
+        }
+
+        static int CategoryOf(object chaListData)
+        {
+            try
+            {
+                var p = chaListData.GetType().GetProperty("categoryNo");
+                return p == null ? -1 : Convert.ToInt32(p.GetValue(chaListData, null));
+            }
+            catch (Exception)
+            {
+                return -1;
+            }
+        }
+
+        static int CategoryOfResolve(object info)
+        {
+            try
+            {
+                return _riCategoryNo == null ? -1 : Convert.ToInt32(_riCategoryNo.GetValue(info, null));
+            }
+            catch (Exception)
+            {
+                return -1;
+            }
+        }
+
+        static IDictionary RowsOf(object chaListData)
+        {
+            try
+            {
+                var p = chaListData.GetType().GetProperty("dictList");
+                return p == null ? null : p.GetValue(chaListData, null) as IDictionary;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        static int IntProp(object info, PropertyInfo property)
+        {
+            try
+            {
+                return property == null ? 0 : Convert.ToInt32(property.GetValue(info, null));
+            }
+            catch (Exception)
+            {
+                return 0;
+            }
+        }
+
+        static void SetIntProp(object info, PropertyInfo property, int value)
+        {
+            try
+            {
+                if (property == null || !property.CanWrite) return;
+                property.SetValue(info, Convert.ChangeType(value, property.PropertyType), null);
+            }
+            catch (Exception)
+            {
+            }
+        }
+
+        static string StringProp(object info, PropertyInfo property)
+        {
+            try
+            {
+                return property == null ? null : property.GetValue(info, null) as string;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
         }
 
         /// <summary>读条目字节、修 CAB、从内存加载。返回 null 表示失败。</summary>

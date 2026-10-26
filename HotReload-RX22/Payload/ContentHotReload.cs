@@ -38,6 +38,7 @@ namespace HotReload.Payload
         {
             _log = log;
 
+            LoadOptions();
             SideloaderBridge.Initialize();
             if (!SideloaderBridge.Available)
                 SayErr("Sideloader 桥接不可用: " + SideloaderBridge.LastError);
@@ -123,6 +124,60 @@ namespace HotReload.Payload
         /// <summary>是否连 list/characustom 的表格和 manifest 一起重读。默认只要 unity3d。</summary>
         public static bool ReloadLists;
 
+        /// <summary>勾选状态存盘：payload 重载会把静态字段清掉，不存的话每次更新插件都会悄悄变回"不读表格"。</summary>
+        static string OptionsPath
+        {
+            get
+            {
+                try { return Path.Combine(Path.Combine(BepInEx.Paths.BepInExRootPath, "hotreload"), "options.txt"); }
+                catch (Exception) { return null; }
+            }
+        }
+
+        static void LoadOptions()
+        {
+            try
+            {
+                var path = OptionsPath;
+                if (path == null || !File.Exists(path)) return;
+
+                var lines = File.ReadAllLines(path);
+                for (int i = 0; i < lines.Length; i++)
+                {
+                    var line = lines[i];
+                    int eq = line.IndexOf('=');
+                    if (eq <= 0) continue;
+
+                    var key = line.Substring(0, eq).Trim();
+                    var value = line.Substring(eq + 1).Trim();
+                    if (key == "reloadLists")
+                        ReloadLists = value == "1" || value.Equals("true", StringComparison.OrdinalIgnoreCase);
+                }
+            }
+            catch (Exception)
+            {
+            }
+        }
+
+        public static void SetReloadLists(bool value)
+        {
+            if (ReloadLists == value) return;
+            ReloadLists = value;
+
+            try
+            {
+                var path = OptionsPath;
+                if (path == null) return;
+
+                var dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                File.WriteAllText(path, "reloadLists=" + (value ? "1" : "0"));
+            }
+            catch (Exception)
+            {
+            }
+        }
+
         public static void Reload()
         {
             try
@@ -131,7 +186,9 @@ namespace HotReload.Payload
                 if (_activeZips.Count == 0) { SayErr("没有已释放的包，先点“释放”"); return; }
 
                 var targets = _activeZips.ToArray();
-                Say("开始重载 " + targets.Length + " 个包（" + (ReloadLists ? "unity3d + 表格" : "仅 unity3d") + "）...");
+                Say("开始重载 " + targets.Length + " 个包（"
+                    + (ReloadLists ? "unity3d + 表格/manifest" : "仅 unity3d，表格/manifest 未勾选：csv/xml 的改动不会生效")
+                    + "）...");
 
                 // 只有需要重载表格时才去拿 ChaListControl，平时不打这层反射
                 var chaList = ReloadLists ? GetChaListControl() : null;
@@ -176,11 +233,18 @@ namespace HotReload.Payload
                 int refreshed = RefreshSceneCharacters();
                 RefreshMakerUi();
 
+                // 饰品/衣服这些窗口有时在自己的 Update 里才读标志，下一帧再来一次更稳
+                if (CoroutineStarter != null)
+                {
+                    try { CoroutineStarter(RefreshMakerUiLater()); }
+                    catch (Exception) { }
+                }
+
                 Say(refreshed > 0
                     ? "重载完成：已刷新 " + refreshed + " 个角色的衣服/饰品/头发"
                     : "重载完成：当前场景没有角色，进场景或重读卡片后生效");
 
-                if (ReloadLists) Say("表格已重新载入：切换一次分类（或重开捏人界面）就能看到新项");
+                if (ReloadLists) Say("表格/manifest 已重读并强刷界面；某个分类若还显示旧项，切一次分类即可");
 
                 var prune = SideloaderBridge.PruneCache();
                 if (!string.IsNullOrEmpty(prune)) Say(prune);
@@ -212,6 +276,12 @@ namespace HotReload.Payload
             return ok;
         }
 
+        static IEnumerator RefreshMakerUiLater()
+        {
+            yield return null;
+            RefreshMakerUi();
+        }
+
         /// <summary>同步捏人界面：列表数据变了以后让它重建一次，否则还显示旧项。</summary>
         static void RefreshMakerUi()
         {
@@ -222,6 +292,43 @@ namespace HotReload.Payload
 
                 // CustomBase 下一帧会按这个标记重建当前界面（分类列表/下拉框都走这里）
                 maker.updateCustomUI = true;
+
+                // 各分类的下拉列表自己缓存着一份数据，只有 _updateCvs* 翻过一次才会重建。
+                // 直接置 true 可能和当前值相同（不触发），所以先 false 再 true。
+                var fields = typeof(ChaCustom.CustomBase).GetFields(
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                for (int i = 0; i < fields.Length; i++)
+                {
+                    if (!fields[i].Name.StartsWith("_updateCvs", StringComparison.Ordinal)) continue;
+
+                    var flag = fields[i].GetValue(maker);
+                    if (flag == null) continue;
+
+                    var array = flag as Array;
+                    if (array != null)
+                    {
+                        // 饰品是 BoolReactiveProperty[]，每个格子一个；不逐个翻的话饰品列表永远不重建
+                        for (int k = 0; k < array.Length; k++) ToggleFlag(array.GetValue(k));
+                        continue;
+                    }
+
+                    ToggleFlag(flag);
+                }
+            }
+            catch (Exception) { }
+        }
+
+        static void ToggleFlag(object flag)
+        {
+            try
+            {
+                if (flag == null) return;
+
+                var value = flag.GetType().GetProperty("Value");
+                if (value == null || !value.CanWrite || value.PropertyType != typeof(bool)) return;
+
+                value.SetValue(flag, false, null);
+                value.SetValue(flag, true, null);
             }
             catch (Exception) { }
         }
